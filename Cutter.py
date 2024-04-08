@@ -20,12 +20,15 @@ def get_nested_attr(obj, attr_path):
 
 def set_nested_attr(obj, attr_path, value):
     attr_names = attr_path.split('.')
-    for attr_name in attr_names[:-1]:
-        if attr_name.isdigit():
-            obj = obj[int(attr_name)]
-        else:
-            obj = getattr(obj, attr_name)
-    setattr(obj, attr_names[-1], value)
+    try:
+        for attr_name in attr_names[:-1]:
+            if attr_name.isdigit():
+                obj = obj[int(attr_name)]
+            else:
+                obj = getattr(obj, attr_name)
+        setattr(obj, attr_names[-1], value)
+    except (AttributeError, IndexError, TypeError) as e:
+        print(f"Warning: Failed to set attribute '{attr_path}': {str(e)}")
 
 def adjust_model_width(model_path, output_path, width_config_path, max_file_size=2**33):
     config = AutoConfig.from_pretrained(model_path)
@@ -52,14 +55,46 @@ def adjust_model_width(model_path, output_path, width_config_path, max_file_size
                 
         if merged_name:
             new_width = int(width_config[merged_name][1:-1].split("x")[-1])
-            if tensor.shape[-1] > new_width:
-                new_tensor = tensor[..., :new_width].clone()
+            if "self_attn.q_proj" in weight_name or "self_attn.k_proj" in weight_name or "self_attn.v_proj" in weight_name:
+                if len(tensor.shape) >= 2 and tensor.shape[-2] > new_width:
+                    new_tensor = tensor[..., :new_width, :].clone()
+                else:
+                    new_tensor = tensor.clone()
             else:
-                new_tensor = tensor.clone()
+                if tensor.shape[-1] > new_width:
+                    new_tensor = tensor[..., :new_width].clone()
+                else:
+                    new_tensor = tensor.clone()
+
+            # 处理权重张量
+            try:
+                new_param = torch.nn.Parameter(new_tensor)
+                set_nested_attr(model, weight_name, new_param)
+            except (AttributeError, IndexError, TypeError):
+                try:
+                    setattr(model, weight_name, new_param)
+                except (AttributeError, IndexError, TypeError):
+                    print(f"Warning: Failed to process the weight tensor for {weight_name}.")
+
+            # 处理对应的偏置张量
+            if weight_name.endswith(".weight"):
+                bias_name = weight_name[:-6] + "bias"  # 将 "weight" 替换为 "bias"
+                try:
+                    bias_tensor = get_nested_attr(model, bias_name)
+                    new_bias_tensor = bias_tensor[:new_width].clone()
+                    new_bias_param = torch.nn.Parameter(new_bias_tensor)
+                    try:
+                        set_nested_attr(model, bias_name, new_bias_param)
+                    except (AttributeError, IndexError, TypeError):
+                        try:
+                            setattr(model, bias_name, new_bias_param)
+                        except (AttributeError, IndexError, TypeError):
+                            print(f"Warning: Failed to process the corresponding bias tensor for {weight_name}.")
+                except (AttributeError, IndexError, TypeError):
+                    print(f"Warning: Failed to get the corresponding bias tensor for {weight_name}.")
         else:
             new_tensor = tensor.clone()
-
-        new_param = torch.nn.Parameter(new_tensor)
+            new_param = torch.nn.Parameter(new_tensor)
 
         # 根据模型的实际属性路径,转换 weight_name
         if "model.layers" in weight_name:
@@ -140,6 +175,10 @@ def adjust_model_width(model_path, output_path, width_config_path, max_file_size
         safetensors_file = f"model-{current_file_index + 1:05d}-of-{total_files:05d}.safetensors"
         safetensors_path = os.path.join(output_path, safetensors_file)
         save_file(current_file_tensors, safetensors_path)
+
+        # 将最后一个文件中的张量添加到索引文件中
+        for tensor_name in current_file_tensors:
+            adjusted_index[tensor_name] = safetensors_file
 
     with open(os.path.join(output_path, "model.safetensors.index.json"), "w") as f:
         json.dump({"metadata": index["metadata"], "weight_map": adjusted_index}, f, indent=2)
