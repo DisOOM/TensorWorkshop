@@ -7,6 +7,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from safetensors import safe_open
 from safetensors.torch import save_file
 from tqdm import tqdm
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 import torch
 
 def get_nested_attr(obj, attr_path):
@@ -56,8 +57,16 @@ def adjust_model_width(model_path, output_path, width_config_path, max_file_size
         if merged_name:
             new_width = int(width_config[merged_name][1:-1].split("x")[-1])
             if "self_attn.q_proj" in weight_name or "self_attn.k_proj" in weight_name or "self_attn.v_proj" in weight_name:
-                if len(tensor.shape) >= 2 and tensor.shape[-2] > new_width:
-                    new_tensor = tensor[..., :new_width, :].clone()
+                if len(tensor.shape) >= 2:
+                    # 对于 self_attn.q_proj, self_attn.k_proj, self_attn.v_proj,同时处理最后两个维度
+                    if tensor.shape[-1] > new_width and tensor.shape[-2] > new_width:
+                        new_tensor = tensor[..., :new_width, :new_width].clone()
+                    elif tensor.shape[-1] > new_width:
+                        new_tensor = tensor[..., :new_width].clone()
+                    elif tensor.shape[-2] > new_width:
+                        new_tensor = tensor[..., :new_width, :].clone()
+                    else:
+                        new_tensor = tensor.clone()
                 else:
                     new_tensor = tensor.clone()
             else:
@@ -76,8 +85,10 @@ def adjust_model_width(model_path, output_path, width_config_path, max_file_size
                 except (AttributeError, IndexError, TypeError):
                     print(f"Warning: Failed to process the weight tensor for {weight_name}.")
 
-            # 处理对应的偏置张量
-            if weight_name.endswith(".weight"):
+            # 为 self_attn.q_proj, self_attn.k_proj, self_attn.v_proj 处理偏置张量
+            if weight_name.endswith(".weight") and any(
+                x in weight_name for x in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
+            ):
                 bias_name = weight_name[:-6] + "bias"  # 将 "weight" 替换为 "bias"
                 try:
                     bias_tensor = get_nested_attr(model, bias_name)
@@ -128,6 +139,21 @@ def adjust_model_width(model_path, output_path, width_config_path, max_file_size
             config.intermediate_size = int(shape_str[1:-1].split("x")[-1])
         elif tensor_name.endswith(".output.dense.weight"):
             config.hidden_size = int(shape_str[1:-1].split("x")[-1])
+        elif tensor_name.endswith(".attention.num_attention_heads"):
+            config.num_attention_heads = int(shape_str[1:-1])
+        elif tensor_name.endswith(".attention.num_key_value_heads"):
+            config.num_key_value_heads = int(shape_str[1:-1])
+
+    # 更新配置文件
+    config_dict = config.to_dict()
+    config_dict["hidden_size"] = config.hidden_size
+    config_dict["intermediate_size"] = config.intermediate_size
+    config_dict["num_attention_heads"] = config.num_attention_heads
+    config_dict["num_key_value_heads"] = config.num_key_value_heads
+
+    # 保存更新后的配置文件
+    with open(os.path.join(output_path, "config.json"), "w") as f:
+        json.dump(config_dict, f, indent=2)
 
     config.save_pretrained(output_path)
 
