@@ -85,9 +85,9 @@ def adjust_model_width(model_path, output_path, width_config_path, max_file_size
 
             elif "mlp.gate_proj.weight" in weight_name:
                 if len(shape_parts) == 2:
-                    new_shape = [int(shape_parts[1]), int(shape_parts[0])]
+                    new_shape = [int(shape_parts[0]), int(shape_parts[1])]
                     if tensor.shape != new_shape:
-                        new_tensor = tensor[:new_shape[1], :new_shape[0]].clone()
+                        new_tensor = tensor[:new_shape[0], :new_shape[1]].clone()
                     else:
                         new_tensor = tensor.clone()
                 else:
