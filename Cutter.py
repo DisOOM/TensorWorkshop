@@ -55,10 +55,13 @@ def adjust_model_width(model_path, output_path, width_config_path, max_file_size
                     break
                 
         if merged_name:
-            new_width = int(width_config[merged_name][1:-1].split("x")[-1])
-            if "self_attn.q_proj" in weight_name or "self_attn.k_proj" in weight_name or "self_attn.v_proj" in weight_name:
+            shape_str = width_config[merged_name]
+            shape_parts = shape_str.strip("[]").split("x")
+            new_width = int(shape_parts[-1])
+
+            if "self_attn.q_proj" in weight_name or "self_attn.k_proj" in weight_name or "self_attn.v_proj" in weight_name or "self_attn.o_proj.weight" in weight_name:
                 if len(tensor.shape) >= 2:
-                    # 对于 self_attn.q_proj, self_attn.k_proj, self_attn.v_proj,同时处理最后两个维度
+                    # 对于 self_attn.q_proj, self_attn.k_proj, self_attn.v_proj, self_attn.o_proj.weight, 同时处理最后两个维度
                     if tensor.shape[-1] > new_width and tensor.shape[-2] > new_width:
                         new_tensor = tensor[..., :new_width, :new_width].clone()
                     elif tensor.shape[-1] > new_width:
@@ -69,8 +72,36 @@ def adjust_model_width(model_path, output_path, width_config_path, max_file_size
                         new_tensor = tensor.clone()
                 else:
                     new_tensor = tensor.clone()
+
+            elif "mlp.down_proj.weight" in weight_name or "mlp.up_proj.weight" in weight_name:
+                if len(shape_parts) == 2:
+                    new_shape = [int(shape_parts[0]), int(shape_parts[1])]
+                    if tensor.shape != new_shape:
+                        new_tensor = tensor[:new_shape[0], :new_shape[1]].clone()
+                    else:
+                        new_tensor = tensor.clone()
+                else:
+                    new_tensor = tensor.clone()
+
+            elif "mlp.gate_proj.weight" in weight_name:
+                if len(shape_parts) == 2:
+                    new_shape = [int(shape_parts[1]), int(shape_parts[0])]
+                    if tensor.shape != new_shape:
+                        new_tensor = tensor[:new_shape[1], :new_shape[0]].clone()
+                    else:
+                        new_tensor = tensor.clone()
+                else:
+                    new_tensor = tensor.clone()
+
             else:
-                if tensor.shape[-1] > new_width:
+                if len(shape_parts) == 2:
+                    # 处理形如 [151936x4096] 的张量
+                    new_shape = [int(shape_parts[0]), new_width]
+                else:
+                    # 处理形如 [4096] 的张量
+                    new_shape = [new_width]
+
+                if tensor.shape != new_shape:
                     new_tensor = tensor[..., :new_width].clone()
                 else:
                     new_tensor = tensor.clone()
@@ -127,29 +158,22 @@ def adjust_model_width(model_path, output_path, width_config_path, max_file_size
     progress_bar.close()
 
     for tensor_name, shape_str in width_config.items():
-        if tensor_name.endswith(".attention.query.weight"):
-            config.hidden_size = int(shape_str[1:-1].split("x")[-1])
-        elif tensor_name.endswith(".attention.key.weight"):
-            config.hidden_size = int(shape_str[1:-1].split("x")[-1])
-        elif tensor_name.endswith(".attention.value.weight"):
-            config.hidden_size = int(shape_str[1:-1].split("x")[-1])
-        elif tensor_name.endswith(".attention.query_key_value.weight"):
-            config.hidden_size = int(shape_str[1:-1].split("x")[-1]) // 3
-        elif tensor_name.endswith(".intermediate.dense.weight"):
-            config.intermediate_size = int(shape_str[1:-1].split("x")[-1])
-        elif tensor_name.endswith(".output.dense.weight"):
-            config.hidden_size = int(shape_str[1:-1].split("x")[-1])
-        elif tensor_name.endswith(".attention.num_attention_heads"):
-            config.num_attention_heads = int(shape_str[1:-1])
-        elif tensor_name.endswith(".attention.num_key_value_heads"):
-            config.num_key_value_heads = int(shape_str[1:-1])
+        shape_str = shape_str.strip("[]")  # 去除形状字符串两端的方括号
+        if tensor_name.endswith(".self_attn.q_proj.weight") or tensor_name.endswith(".self_attn.k_proj.weight") or tensor_name.endswith(".self_attn.v_proj.weight"):
+            config.hidden_size = int(shape_str.split("x")[-1])
+        elif tensor_name.endswith(".mlp.down_proj.weight"):
+            config.intermediate_size = int(shape_str.split("x")[-1])
+        elif tensor_name.endswith(".mlp.up_proj.weight"):
+            config.hidden_size = int(shape_str.split("x")[0])
+            
+    # 调整注意力头的数量
+    config.num_attention_heads = config.hidden_size // 128  # 假设每个注意力头的维度为128,这个和具体架构有关，到时候得依据架构来读
+    config.num_key_value_heads = config.num_attention_heads
 
     # 更新配置文件
     config_dict = config.to_dict()
     config_dict["hidden_size"] = config.hidden_size
     config_dict["intermediate_size"] = config.intermediate_size
-    config_dict["num_attention_heads"] = config.num_attention_heads
-    config_dict["num_key_value_heads"] = config.num_key_value_heads
 
     # 保存更新后的配置文件
     with open(os.path.join(output_path, "config.json"), "w") as f:
